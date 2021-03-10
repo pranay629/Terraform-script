@@ -1,0 +1,294 @@
+Task: Create Terraform Script to launch AWS Infrastructure for a Web Application
+Given Task Algorithm
+1.Create the key and security group which allows the port 80, 443.
+2.Launch EC2 instance.
+3.In this Ec2 instance used the key and security group which we have created in step 1. 
+4.Launch one Volume (EBS) and mount that volume into /var/www/html
+5. A developer has uploaded the code into GitHub repo also the repo has some images.
+6.Copy the GitHub repo code into /var/www/html
+7.Create a S3 bucket, and copy/deploy the images from GitHub repo into the s3 bucket and
+change the permission to public readable.
+8.Create a Cloudfront using s3 bucket(which contains images) and use the Cloudfront URL
+to update in code in /var/www/html
+Prerequisite: You must have AWS-CLI and git installed.
+
+1. Configure the Provider To do this step first of all I need to have AWS-CLI signed in.
+provider
+"aws" {
+region ="ap-south-1"
+profile ="pranay"
+}
+2. Create Key Pair 
+resource “tls_private_key” “webserver_private_key” {
+ algorithm = “RSA”
+ rsa_bits = 4096
+}
+resource “local_file” “private_key” {
+content = tls_private_key.webserver_private_key.private_key_pem
+filename = “webserver_key.pem”
+file_permission = 0400
+}resource “aws_key_pair” “webserver_key” {
+key_name = “webserver”
+public_key = tls_private_key.webserver_private_key.public_key_openssh
+}
+Here I have used resource ‘tls_private_key’ to create private key saved locally with the name ‘webserver_key.pem’. Then to create ‘AWS Key Pair’ I used
+resource ‘aws_key_pair’ and used my private key here as public key.
+
+3.Create a Security Group 
+I want to access my website through HTTP and HTTPS protocol so
+need to set these rule while creating a Security group. Also, I want remote
+access of instances (OS) through SSH to configure it.
+
+resource "aws_security_group" "allow_http_ssh" {
+  name  = "allow_http"
+  description = "Allow http inbound traffic"ingress {
+    description = "http"
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"] 
+  }
+ name        = "allow_https"
+  description = "Allow https inbound traffic"ingress {
+    description = "https"
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+ingress {
+    description = "ssh"
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+   }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }tags = {
+    Name = "allow_http_ssh"
+  }
+}
+Ingress rules are for the traffic that enters the boundary of a network. Egress rules imply to traffic
+exits instance or network. Configured security group to allow SSH, HTTP and HTTPS access.
+
+4.
+Launch EC2 instance want to deploy my website on EC2 instance so that I need to launch 2 instances
+with installed servers and other dependencies. For that, I created 2 instances
+and downloading https, PHP, git to configure it.
+resource "aws_instance"
+"webserver" {
+  ami = "ami-0447a12f28fddb066"
+  instance_type = "t2.micro" 
+  key_name = aws_key_pair.webserver_key.key_name
+security_groups=[aws_security_group.allow_http_https_ssh.name]tags = {
+    Name = "webserver_1"
+   }
+
+  connection {
+        type = "ssh"
+        user = "ec2-user"
+        host = aws_instance.webserver.public_ip
+        port = 22.
+        private_key = tls_private_key.webserver_private_key.private_key_pem
+    }
+  provisioner "remote-exec" {
+        inline = [
+        "sudo yum install httpd php git -y",
+        "sudo systemctl start httpd",
+        "sudo systemctl enable httpd",
+        ]
+    }
+}
+
+resource "aws_instance" "webserver" {
+  ami = "ami-0447a12f28fddb066"
+  instance_type = "t2.micro" 
+  key_name = aws_key_pair.webserver_key.key_name
+security_groups=[aws_security_group.allow_http_https_ssh.name]tags = {
+    Name = "webserver_2"
+
+  }
+  connection {
+       type   = "ssh"
+        user  = "ec2-user"
+        host  = aws_instance.webserver.public_ip
+        port  = 22
+        private_key = tls_private_key.webserver_private_key.private_key_pem
+    }
+
+  provisioner "remote-exec" {
+
+        inline = [
+
+       "sudo yum install httpd php git -y",
+        "sudo systemctl start httpd",
+        "sudo systemctl enable httpd",
+        ]
+   }
+}
+I have created 2 instances in the Security group with amazon Linux(ami-0447a12f28fddb066), type of ‘t2.micro’, and keypair that I have
+created above. I have used Provisioner. (Provisioners are used to execute scripts on a local or remote
+machine as part of resource creation or destruction). 
+5.
+Create EBS Volume
+Iwant to store code in persistent storage so that instance termination could not
+affect it for that I have created EBS Volume.
+resource "aws_ebs_volume" "my_volume" {
+    availability_zone = aws_instance.webserver.availability_zone
+    size              = 1
+   tags = {
+       Name = "webserver-pd"
+    }
+}
+
+To attach a volume to EC2 instance it must be in the same availability zone of instance. Here size is 1GB and a tag is ‘webserver-pd’.
+
+6.Attach EBS volume to EC2 instance.
+Our requirement is to copy code into EBS volume for that we need to attach EBS
+volume to EC2 instance.
+resource "aws_volume_attachment" "ebs_attachment" {
+   device_name = "/dev/xvdf"
+    volume_id   =  aws_ebs_volume.my_volume.id
+    instance_id = aws_instance.webserver.id
+    force_detach =true     
+   depends_on=[ aws_ebs_volume.my_volume,aws_ebs_volume.my_volume]
+}
+
+This resource has dependency on EBS volume and instance. Because until they are not created I cannot attach them. While destroying if the volume is attached to the instance I cannot destroy it gives ‘volume is busy’ error. For that, I used force_detach = true.
+7.
+Create S3 Bucket
+resource "aws_s3_bucket" "task1_s3bucket" {
+  bucket = "website-images-res"
+  acl    = "public-read"
+  tags = {
+    Name        = "My bucket"
+    Environment = "Dev"
+  }    
+}
+
+I used terraform’s resource ‘aws_s3_bucket’ to create a bucket. To create a s3 bucket I must give a unique name to the bucket. ‘Here’s bucket name is ‘website-images-res’.
+
+8. Add Object into S3 Here in my case, I want to upload images from GitHub into the S3 bucket. I have used local-provisioner to download images from GitHub locally and then upload it to the S3 bucket.
+resource "null_resource" "images_repo" {
+  provisioner "local-exec" {
+    command = "git clone https://github.com/raghavendra09/myimages.git my_images"
+
+  }
+  provisioner "local-exec"{ 
+  when        =   destroy
+  command     =   "rm -rf my_images"
+    }
+}
+resource "aws_s3_bucket_object" "sun_image" {
+  bucket = aws_s3_bucket.task1_s3bucket.bucket
+ key    = "sun.png"
+  source = "my_images/sun.png"
+  acl="public-read"
+   depends_on = [aws_s3_bucket.task1_s3bucket,null_resource.images_repo]
+}
+
+9.
+Create CloudFront for S3 resource "aws_cloudfront_distribution" "s3_distribution" {
+  origin {
+    domain_name = aws_s3_bucket.task1_s3bucket.bucket_regional_domain_name
+    origin_id   = aws_s3_bucket.task1_s3bucket.id
+     custom_origin_config {
+            http_port = 80
+            https_port = 443
+            origin_protocol_policy = "match-viewer"
+            origin_ssl_protocols = ["TLSv1", "TLSv1.1", "TLSv1.2"]
+        }
+  }
+
+  enabled             = true
+  is_ipv6_enabled     = true
+  comment             = "Some comment"default_cache_behavior {
+    allowed_methods  = ["DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"]
+    cached_methods   = ["GET", "HEAD"]
+    target_origin_id = aws_s3_bucket.task1_s3bucket.idforwarded_values {
+      query_string = falsecookies {
+        forward = "none"
+      }
+    }
+   viewer_protocol_policy = "allow-all"
+  }
+ price_class = "PriceClass_200"restrictions {
+        geo_restriction {
+        restriction_type = "none"
+        }
+    }
+
+viewer_certificate {
+    cloudfront_default_certificate = true
+ }
+ depends_on = [aws_s3_bucket.task1_s3bucket]
+}
+I created CloudFront distribution for our s3 bucket that I have created early.
+10. Now let's do some Coding.
+ I want to do is to show images from the S3 bucket using the CloudFront URL. It changes every time when I create/apply. I don’t want us to write website code in terraform provisioner. 
+Let’s create a simple page using
+PHP language.
+<html>
+<body>
+<h1>Hello World!</h1>
+<h5><b>Below image is from cloudfront</b></h5>
+<?php
+   $firstline=`head -n1 path.txt`;          
+   $path_img="https://".$firstline."/sun.png";
+   echo "<br>";
+   echo "<img src='{$path_img}' width=500 height=500>";
+?>
+</body>
+</html>
+What I am doing here is reading a file which will have CloudFront URL. Creating a link in $path_img variable and using this I am giving it as src to img tag.
+11.
+Time to Deploy Code
+I want to download our code from the git repository into the document root in our case /var/www/html. And store CloudFront URL into path.txt. So images can be accessed via CloudFront.
+resource "null_resource" "nullremote"  {
+depends_on = [  aws_volume_attachment.ebs_attachment,aws_cloudfront_distribution.s3_distribution
+   ]
+    connection {
+        type    = "ssh"
+        user    = "ec2-user"
+        host    = aws_instance.webserver.public_ip
+        port    = 22
+        private_key = tls_private_key.webserver_private_key.private_key_pem
+    }
+  provisioner "remote-exec" {
+        inline  = [
+    "sudo mkfs.ext4 /dev/xvdf",
+     "sudo mount /dev/xvdf /var/www/html",
+     "sudo rm -rf /var/www/html/*",
+     "sudo git clone https://github.com/raghavendra09/demo.git /var/www/html/",
+     "sudo su << EOF",
+           "echo \"${aws_cloudfront_distribution.s3_distribution.domain_name}\" >> /var/www/html/path.txt",
+            "EOF",
+     "sudo systemctl restart httpd"
+ ]
+    }
+}
+We want to store our code in persistent storage i.e. EBS volume. To use this storage we require to format it then mount it. Then we copied
+(clone) code from git using ‘git clone’ command. We created a file inside the
+instance that has the CloudFront URL link of s3 and stored it into
+/var/www/html.
+12.
+output "IP"{
+ value=aws_instance.webserver.public_ip
+}
+Now time to run/apply
+infrastructure.
+#initalise
+and download pulgins
+$ terraform init                                             #check
+for errors
+$ terraform validate                                     #build the
+infrastructure
+$ terraform apply -auto-approve               
+#destroy the infrastructure
+$ terraform destroy -auto-approve
+The public address will be print on the terminal copy that and paste in browser.
